@@ -1,0 +1,30 @@
+// NanoScript demo — all variables are int64
+
+x = 10;
+y = 32;
+z = x + y;
+
+out z;                // prints 42
+
+// Arithmetic
+product = x * y;
+out product;          // prints 320
+
+diff = z - x;
+out diff;             // prints 32
+
+// Conditionals
+limit = 40;
+if (z > limit) {
+    out 1;            // z=42 > 40, so prints 1
+}
+
+// Nested expression
+result = (x + y) * 2;
+out result;           // prints 84
+
+counter = 1;
+if (counter == 1) {
+    counter = counter + 1;
+    out counter;      // prints 2
+}

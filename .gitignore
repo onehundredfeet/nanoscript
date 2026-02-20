@@ -1,0 +1,12 @@
+# Build output
+build/
+compile_commands.json
+
+# Compiler artifacts
+output.ll
+output.o
+nano_binary
+nano_binary.dSYM/
+
+# macOS
+.DS_Store
