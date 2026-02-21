@@ -28,3 +28,4 @@ if (counter == 1) {
     counter = counter + 1;
     out counter;      // prints 2
 }
+
