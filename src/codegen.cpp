@@ -2,26 +2,34 @@
 
 #include <llvm/IR/DerivedTypes.h>
 #include <llvm/IR/Verifier.h>
+#include <llvm/Passes/PassBuilder.h>
 #include <llvm/Support/FileSystem.h>
 #include <llvm/Support/raw_ostream.h>
+#include <llvm/TargetParser/Host.h>
 #include <llvm/TargetParser/Triple.h>
 
 #include <stdexcept>
 
 // ── Constructor ────────────────────────────────────────────────────────────
 
-Codegen::Codegen(const std::string& sourceFile, const std::string& sourceDir)
-    : builder_(context_)
+Codegen::Codegen(const std::string& sourceFile, const std::string& sourceDir,
+                 BuildConfig config, bool wasm)
+    : builder_(context_), config_(config), wasm_(wasm)
 {
     setupModule();
-    setupDebugInfo(sourceFile, sourceDir);
+
+    // Debug info: present for Debug and Development regardless of target
+    if (config_ != BuildConfig::Shipping)
+        setupDebugInfo(sourceFile, sourceDir);
+
     declarePrintf();
 
     int64Ty_ = llvm::Type::getInt64Ty(context_);
     int32Ty_ = llvm::Type::getInt32Ty(context_);
     ptrTy_   = llvm::PointerType::getUnqual(context_);   // opaque ptr
 
-    diInt64Ty_ = diBuilder_->createBasicType("int64", 64, llvm::dwarf::DW_ATE_signed);
+    if (diBuilder_)
+        diInt64Ty_ = diBuilder_->createBasicType("int64", 64, llvm::dwarf::DW_ATE_signed);
 }
 
 // ── Module / target setup ─────────────────────────────────────────────────
@@ -29,18 +37,28 @@ Codegen::Codegen(const std::string& sourceFile, const std::string& sourceDir)
 void Codegen::setupModule() {
     module_ = std::make_unique<llvm::Module>("nanoscript", context_);
 
-    // Apple Silicon target — hardcode so we don't need the AArch64 backend
-    // (we only emit .ll text, not machine code).
-    // LLVM 21: setTargetTriple requires an explicit llvm::Triple object.
-    module_->setTargetTriple(llvm::Triple("arm64-apple-macosx13.0.0"));
-    module_->setDataLayout(
-        "e-m:o-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-n32:64-S128-Fn32");
-
-    // Required module flags so clang -g can read the DWARF debug info
-    module_->addModuleFlag(llvm::Module::Warning, "Dwarf Version",       5);
-    module_->addModuleFlag(llvm::Module::Warning, "Debug Info Version",
-                           llvm::DEBUG_METADATA_VERSION);   // == 3
-    module_->addModuleFlag(llvm::Module::Max,     "PIC Level",           2);
+    if (wasm_) {
+        // wasm32-wasi — used for all configs when --wasm is passed
+        module_->setTargetTriple(llvm::Triple("wasm32-unknown-wasi"));
+        module_->setDataLayout(
+            "e-m:e-p:32:32-p10:8:8-p20:8:8-i64:64-i128:128-n32:64-S128-ni:1:10:20");
+        if (config_ != BuildConfig::Shipping) {
+            module_->addModuleFlag(llvm::Module::Warning, "Dwarf Version",      5);
+            module_->addModuleFlag(llvm::Module::Warning, "Debug Info Version",
+                                   llvm::DEBUG_METADATA_VERSION);
+        }
+    } else {
+        // Native — use the host triple so clang doesn't warn about a mismatch
+        module_->setTargetTriple(llvm::Triple(llvm::sys::getDefaultTargetTriple()));
+        module_->setDataLayout(
+            "e-m:o-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-n32:64-S128-Fn32");
+        module_->addModuleFlag(llvm::Module::Max, "PIC Level", 2);
+        if (config_ != BuildConfig::Shipping) {
+            module_->addModuleFlag(llvm::Module::Warning, "Dwarf Version",      5);
+            module_->addModuleFlag(llvm::Module::Warning, "Debug Info Version",
+                                   llvm::DEBUG_METADATA_VERSION);
+        }
+    }
 }
 
 // ── DWARF debug-info setup ────────────────────────────────────────────────
@@ -50,10 +68,10 @@ void Codegen::setupDebugInfo(const std::string& sourceFile,
     diBuilder_     = std::make_unique<llvm::DIBuilder>(*module_);
     diFile_        = diBuilder_->createFile(sourceFile, sourceDir);
     diCompileUnit_ = diBuilder_->createCompileUnit(
-        llvm::dwarf::DW_LANG_C,          // closest standard language
+        llvm::dwarf::DW_LANG_C,
         diFile_,
-        "NanoScript Compiler 1.0",       // producer string
-        /*isOptimized=*/false,
+        "NanoScript Compiler 1.0",
+        /*isOptimized=*/config_ != BuildConfig::Debug,
         /*Flags=*/"",
         /*RuntimeVersion=*/0);
 }
@@ -89,26 +107,36 @@ llvm::Function* Codegen::createMainFunction() {
     auto* mainFn = llvm::Function::Create(
         mainTy, llvm::Function::ExternalLinkage, "main", *module_);
 
-    // DISubroutineType: () -> int (return type only, no params for a simple main)
-    auto* retDITy = diBuilder_->createBasicType("int", 32, llvm::dwarf::DW_ATE_signed);
-    auto* subTy   = diBuilder_->createSubroutineType(
-        diBuilder_->getOrCreateTypeArray({retDITy}));
+    if (wasm_) {
+        // wasm32-wasi: crt1's _start calls __main_void, not main directly.
+        // Emit the hidden alias clang would generate from C source so that
+        // wasm-ld can resolve the undefined_weak:main reference in crt1.
+        mainFn->setVisibility(llvm::GlobalValue::HiddenVisibility);
+        auto* alias = llvm::GlobalAlias::create(
+            mainTy, 0,
+            llvm::GlobalValue::ExternalLinkage,
+            "__main_void", mainFn, module_.get());
+        alias->setVisibility(llvm::GlobalValue::HiddenVisibility);
+    }
 
-    diMainFunc_ = diBuilder_->createFunction(
-        diCompileUnit_,
-        "main", "main",
-        diFile_,
-        /*LineNo=*/1,
-        subTy,
-        /*ScopeLine=*/1,
-        llvm::DINode::FlagPrototyped,
-        llvm::DISubprogram::SPFlagDefinition);
-    mainFn->setSubprogram(diMainFunc_);
+    if (diBuilder_) {
+        auto* retDITy = diBuilder_->createBasicType("int", 32, llvm::dwarf::DW_ATE_signed);
+        auto* subTy   = diBuilder_->createSubroutineType(
+            diBuilder_->getOrCreateTypeArray({retDITy}));
+        diMainFunc_ = diBuilder_->createFunction(
+            diCompileUnit_,
+            "main", "main",
+            diFile_,
+            /*LineNo=*/1,
+            subTy,
+            /*ScopeLine=*/1,
+            llvm::DINode::FlagPrototyped,
+            llvm::DISubprogram::SPFlagDefinition);
+        mainFn->setSubprogram(diMainFunc_);
+    }
 
     auto* entry = llvm::BasicBlock::Create(context_, "entry", mainFn);
     builder_.SetInsertPoint(entry);
-
-    // Disable debug location briefly while emitting preamble allocas
     builder_.SetCurrentDebugLocation(llvm::DebugLoc());
     return mainFn;
 }
@@ -117,18 +145,13 @@ llvm::Function* Codegen::createMainFunction() {
 
 llvm::AllocaInst* Codegen::createEntryAlloca(llvm::Function* fn,
                                               const std::string& name) {
-    // Save current insertion point
     auto savedIP = builder_.saveIP();
-
-    // Insert after all existing allocas at the top of the entry block
-    auto& entry = fn->getEntryBlock();
-    auto  it    = entry.begin();
+    auto& entry  = fn->getEntryBlock();
+    auto  it     = entry.begin();
     while (it != entry.end() && llvm::isa<llvm::AllocaInst>(*it))
         ++it;
     builder_.SetInsertPoint(&entry, it);
-
     auto* alloca = builder_.CreateAlloca(int64Ty_, nullptr, name);
-
     builder_.restoreIP(savedIP);
     return alloca;
 }
@@ -152,14 +175,16 @@ void Codegen::generate(const ProgramNode& program) {
     for (const auto& stmt : program.statements)
         genStatement(*stmt, mainFn);
 
-    // Return 0 — attach debug loc to the final 'ret' as well
     setDebugLoc(1, 1);
     builder_.CreateRet(llvm::ConstantInt::get(int32Ty_, 0));
 
-    diBuilder_->finalizeSubprogram(diMainFunc_);
-    diBuilder_->finalize();
+    if (diBuilder_) {
+        diBuilder_->finalizeSubprogram(diMainFunc_);
+        diBuilder_->finalize();
+    }
 
-    // Verify the generated IR
+    optimize();
+
     std::string errors;
     llvm::raw_string_ostream es(errors);
     if (llvm::verifyModule(*module_, &es)) {
@@ -191,28 +216,28 @@ void Codegen::genStatement(const StmtNode& stmt, llvm::Function* fn) {
 void Codegen::genAssignment(const AssignmentNode& node, llvm::Function* fn) {
     setDebugLoc(node.line, node.col);
 
-    // Declare variable on first use
     if (variables_.find(node.varName) == variables_.end()) {
         auto* alloca = createEntryAlloca(fn, node.varName);
         variables_[node.varName] = alloca;
 
-        // Register with DIBuilder so debuggers can inspect the variable
-        auto* diVar = diBuilder_->createAutoVariable(
-            diMainFunc_, node.varName, diFile_,
-            static_cast<unsigned>(node.line), diInt64Ty_);
-        auto* loc = llvm::DILocation::get(context_,
-                                          static_cast<unsigned>(node.line),
-                                          static_cast<unsigned>(node.col),
-                                          diMainFunc_);
-        diBuilder_->insertDeclare(
-            alloca, diVar,
-            diBuilder_->createExpression(),
-            loc,
-            builder_.GetInsertBlock());
+        if (diBuilder_) {
+            auto* diVar = diBuilder_->createAutoVariable(
+                diMainFunc_, node.varName, diFile_,
+                static_cast<unsigned>(node.line), diInt64Ty_);
+            auto* loc = llvm::DILocation::get(context_,
+                                              static_cast<unsigned>(node.line),
+                                              static_cast<unsigned>(node.col),
+                                              diMainFunc_);
+            diBuilder_->insertDeclare(
+                alloca, diVar,
+                diBuilder_->createExpression(),
+                loc,
+                builder_.GetInsertBlock());
+        }
     }
 
     llvm::Value* val = genExpr(*node.value);
-    setDebugLoc(node.line, node.col);   // re-set after expr codegen may change it
+    setDebugLoc(node.line, node.col);
     builder_.CreateStore(val, variables_[node.varName]);
 }
 
@@ -223,7 +248,6 @@ void Codegen::genIf(const IfNode& node, llvm::Function* fn) {
 
     llvm::Value* cond = genExpr(*node.condition);
 
-    // If the condition is i64 (non-comparison expr), convert to i1 != 0
     if (cond->getType() == int64Ty_) {
         setDebugLoc(node.line, node.col);
         cond = builder_.CreateICmpNE(cond, llvm::ConstantInt::get(int64Ty_, 0), "ifcond");
@@ -234,7 +258,6 @@ void Codegen::genIf(const IfNode& node, llvm::Function* fn) {
 
     builder_.CreateCondBr(cond, thenBB, mergeBB);
 
-    // ── then block ────────────────────────────────────────────────────────
     builder_.SetInsertPoint(thenBB);
     for (const auto& s : node.body)
         genStatement(*s, fn);
@@ -242,7 +265,6 @@ void Codegen::genIf(const IfNode& node, llvm::Function* fn) {
     if (!builder_.GetInsertBlock()->getTerminator())
         builder_.CreateBr(mergeBB);
 
-    // ── continue after if ─────────────────────────────────────────────────
     builder_.SetInsertPoint(mergeBB);
 }
 
@@ -254,7 +276,6 @@ void Codegen::genOut(const OutNode& node) {
     llvm::Value* val = genExpr(*node.expr);
     setDebugLoc(node.line, node.col);
 
-    // GEP into the "%lld\n" global to get a ptr to its first byte
     auto* zero   = llvm::ConstantInt::get(int32Ty_, 0);
     auto* fmtPtr = builder_.CreateInBoundsGEP(
         fmtStr_->getValueType(), fmtStr_, {zero, zero}, "fmtptr");
@@ -282,9 +303,9 @@ llvm::Value* Codegen::genExpr(const ExprNode& expr) {
             return builder_.CreateLoad(int64Ty_, it->second, n.name);
         }
         case NodeKind::BinaryOp: {
-            const auto& n     = static_cast<const BinaryOpNode&>(expr);
-            llvm::Value* lhs  = genExpr(*n.left);
-            llvm::Value* rhs  = genExpr(*n.right);
+            const auto& n    = static_cast<const BinaryOpNode&>(expr);
+            llvm::Value* lhs = genExpr(*n.left);
+            llvm::Value* rhs = genExpr(*n.right);
             setDebugLoc(n.line, n.col);
 
             if (n.opStr == "+") return builder_.CreateAdd (lhs, rhs, "add");
@@ -292,7 +313,6 @@ llvm::Value* Codegen::genExpr(const ExprNode& expr) {
             if (n.opStr == "*") return builder_.CreateMul (lhs, rhs, "mul");
             if (n.opStr == "/") return builder_.CreateSDiv(lhs, rhs, "div");
 
-            // Comparison — result is i1, sign-extend to i64 for uniformity
             llvm::Value* cmp = nullptr;
             if      (n.opStr == "==") cmp = builder_.CreateICmpEQ (lhs, rhs, "eq");
             else if (n.opStr == "!=") cmp = builder_.CreateICmpNE (lhs, rhs, "ne");
@@ -306,6 +326,34 @@ llvm::Value* Codegen::genExpr(const ExprNode& expr) {
         default:
             throw std::runtime_error("Unknown expression kind in codegen");
     }
+}
+
+// ── Optimisation pipeline ─────────────────────────────────────────────────
+
+void Codegen::optimize() {
+    if (config_ == BuildConfig::Debug) return;
+
+    llvm::PassBuilder            pb;
+    llvm::LoopAnalysisManager    lam;
+    llvm::FunctionAnalysisManager fam;
+    llvm::CGSCCAnalysisManager   cgam;
+    llvm::ModuleAnalysisManager  mam;
+
+    pb.registerModuleAnalyses(mam);
+    pb.registerCGSCCAnalyses(cgam);
+    pb.registerFunctionAnalyses(fam);
+    pb.registerLoopAnalyses(lam);
+    pb.crossRegisterProxies(lam, fam, cgam, mam);
+
+    llvm::ModulePassManager mpm;
+    if (config_ == BuildConfig::Development) {
+        mpm = pb.buildPerModuleDefaultPipeline(llvm::OptimizationLevel::O2);
+    } else {
+        // Shipping: full LTO pipeline at O3 — whole-program optimisation
+        // ExportSummary=nullptr: single-module build, no cross-module index needed
+        mpm = pb.buildLTODefaultPipeline(llvm::OptimizationLevel::O3, nullptr);
+    }
+    mpm.run(*module_, mam);
 }
 
 // ── IR output ─────────────────────────────────────────────────────────────

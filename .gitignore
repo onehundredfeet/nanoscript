@@ -3,10 +3,12 @@ build/
 compile_commands.json
 
 # Compiler artifacts
-output.ll
-output.o
+*.ll
+*.o
 nano_binary
-nano_binary.dSYM/
 
 # macOS
 .DS_Store
+*.dSYM
+hello_debug
+*.wasm

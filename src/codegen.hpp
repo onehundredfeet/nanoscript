@@ -11,16 +11,30 @@
 #include <memory>
 #include <string>
 
+enum class BuildConfig {
+    Debug,        // O0  + full DWARF
+    Development,  // O2  + full DWARF
+    Shipping      // O3 (LTO) + no debug info
+};
+
 class Codegen {
 public:
     /// sourceFile — basename of the .nano file (e.g. "hello.nano")
     /// sourceDir  — directory that contains it (e.g. "/home/user/examples")
-    Codegen(const std::string& sourceFile, const std::string& sourceDir);
+    /// config     — optimisation level and debug-info presence
+    /// wasm       — true → wasm32-wasi target; false → native ARM64
+    Codegen(const std::string& sourceFile, const std::string& sourceDir,
+            BuildConfig config = BuildConfig::Debug,
+            bool wasm = false);
 
     void generate(const ProgramNode& program);
     void writeIR(const std::string& outputPath);
 
 private:
+    // ── Build configuration ───────────────────────────────────────────────
+    BuildConfig config_;
+    bool        wasm_;
+
     // ── LLVM core objects ─────────────────────────────────────────────────
     llvm::LLVMContext                context_;
     std::unique_ptr<llvm::Module>    module_;
@@ -48,6 +62,10 @@ private:
     // ── Private helpers ───────────────────────────────────────────────────
     void setupModule();
     void setupDebugInfo(const std::string& sourceFile, const std::string& sourceDir);
+
+    /// Run the LLVM pass pipeline appropriate for config_.
+    /// Debug → no-op; Development → O2; Shipping → O3 full-LTO.
+    void optimize();
     void declarePrintf();
     llvm::Function* createMainFunction();
 

@@ -4,11 +4,27 @@
         {
             "type": "lldb",
             "request": "launch",
-            "name": "Debug nano_binary (CodeLLDB)",
+            "name": "Debug (Wasmtime / JIT)",
+            "program": "/opt/homebrew/bin/wasmtime",
+            "args": [
+                "run",
+                "-D", "debug-info",
+                "${workspaceFolder}/output.wasm"
+            ],
+            "cwd": "${workspaceFolder}",
+            "preLaunchTask": "compile-debug-wasm",
+            "initCommands": [
+                "settings set plugin.jit-loader.gdb.enable on"
+            ]
+        },
+        {
+            "type": "lldb",
+            "request": "launch",
+            "name": "Debug (native binary)",
             "program": "${workspaceFolder}/nano_binary",
             "args": [],
             "cwd": "${workspaceFolder}",
-            "preLaunchTask": "build-and-compile"
+            "preLaunchTask": "compile-debug-native"
         }
     ]
 }

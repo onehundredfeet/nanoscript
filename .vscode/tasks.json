@@ -17,24 +17,24 @@
             "group": "build"
         },
         {
-            "label": "nanoscript-compile",
+            "label": "compile-debug-wasm",
             "type": "shell",
-            "command": "./build/nanoscript examples/hello.nano output.ll",
+            "command": "${workspaceFolder}/build/nanoscript ${file} --config=debug --wasm ${workspaceFolder}/output.wasm",
             "dependsOn": "cmake-build",
-            "options": { "cwd": "${workspaceFolder}" },
-            "group": "build"
-        },
-        {
-            "label": "build-and-compile",
-            "type": "shell",
-            "command": "/opt/homebrew/opt/llvm/bin/clang -g -c output.ll -o output.o && /opt/homebrew/opt/llvm/bin/clang -g output.o -o nano_binary && dsymutil nano_binary",
-            "dependsOn": "nanoscript-compile",
             "dependsOrder": "sequence",
             "options": { "cwd": "${workspaceFolder}" },
-            "group": {
-                "kind": "build",
-                "isDefault": true
-            }
+            "group": { "kind": "build", "isDefault": true },
+            "presentation": { "reveal": "silent", "panel": "shared" }
+        },
+        {
+            "label": "compile-debug-native",
+            "type": "shell",
+            "command": "${workspaceFolder}/build/nanoscript ${file} --config=debug ${workspaceFolder}/nano_binary",
+            "dependsOn": "cmake-build",
+            "dependsOrder": "sequence",
+            "options": { "cwd": "${workspaceFolder}" },
+            "group": "build",
+            "presentation": { "reveal": "silent", "panel": "shared" }
         }
     ]
 }
